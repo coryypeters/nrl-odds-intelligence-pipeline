@@ -1,0 +1,48 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  poller:
+    build: ./poller
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  processor:
+    build: ./processor
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  redis_data:
