@@ -1,11 +1,31 @@
-# Real-Time Odds Intelligence Pipeline
+# NRL Odds Intelligence Pipeline
 
-An event-driven streaming pipeline that polls live sports betting odds, diffs
-successive snapshots to detect **line movement**, **steam moves**, and
-**arbitrage windows**, and pushes alerts to a live dashboard over WebSocket.
+A real-time, event-driven pipeline that ingests live sports-betting odds across
+multiple bookmakers, detects **line movement**, **steam moves**, and
+**arbitrage windows** by diffing successive snapshots, and streams the signals
+to a live dashboard over WebSocket.
 
-> **Status:** Step 1 complete — the ingestion layer (poller → Redis Streams).
-> Remaining steps scoped below.
+![Dashboard](docs/dashboard.png)
+
+> Built as a portfolio project to demonstrate streaming data engineering,
+> real-time detection, and full-stack delivery. It is an **odds-analysis tool,
+> not a bookmaker** — all analysis is derived from market data, with responsible
+> gambling guidance built into the UI.
+
+## What it does
+
+- **Polls** The Odds API on a match-window-aware schedule (slows down when
+  nothing is on, speeds up near kickoff) to respect the free-tier quota.
+- **Streams** every odds snapshot into Redis Streams, consumed by a separate
+  processor via a consumer group (at-least-once delivery, survives restarts).
+- **Detects** three signal types by diffing snapshots:
+  - *Line movement* — a notable price shift on one book/outcome
+  - *Steam* — several books shortening the same outcome together (sharp money)
+  - *Arbitrage* — best cross-book prices implying < 100%, with stake split
+- **Pushes** detected signals to the browser in real time over WebSocket.
+- **Analyses** each match on a dedicated page: vig-removed implied probability,
+  bookmaker margin, book-by-book price comparison, line-movement chart, a
+  derived expected-margin model, value flags, and live scores.
 
 ## Architecture
 
@@ -13,126 +33,93 @@ successive snapshots to detect **line movement**, **steam moves**, and
 The Odds API
      │
      ▼
-Poller (APScheduler, match-window-aware cadence)   ◄── Step 1 (done)
+Poller (APScheduler, adaptive cadence)        ── ingestion
      │  raw odds snapshots
      ▼
-Redis Streams  ──── raw_odds stream
+Redis Streams ──── raw_odds
      │
      ▼
-Stream Processor (consumer group)                  ◄── Step 2
-     ├── diff engine        (snapshot deltas)
-     ├── movement / steam   (line shift + multi-book consensus)
-     └── arb scanner        (cross-book +EV windows)
+Processor (consumer group)                    ── detection
+     ├── diff engine        (per-book, per-outcome deltas)
+     ├── movement / steam   (shift + multi-book consensus)
+     └── arbitrage scanner  (cross-book +EV, stake allocation)
      │
      ▼
-Redis (live event store)
+Redis (event store + pub/sub)
      │
      ▼
-FastAPI + WebSocket                                ◄── Step 4
+FastAPI + WebSocket                           ── delivery
      │
      ▼
-React dashboard                                    ◄── Step 5
+React dashboard + match analysis pages        ── UI
 ```
+
+Five containerised services orchestrated with Docker Compose: `redis`,
+`poller`, `processor`, `api`, `frontend`.
+
+## Tech stack
+
+| Layer        | Tech |
+| ------------ | ---- |
+| Ingestion    | Python, APScheduler, httpx |
+| Broker/store | Redis Streams, pub/sub |
+| Processing   | Python (consumer groups, pure diff/detection logic) |
+| API          | FastAPI, WebSockets, uvicorn |
+| Frontend     | React, Vite, react-router, Recharts |
+| Infra        | Docker, Docker Compose, nginx |
 
 ## Coverage
 
-Odds come from **The Odds API** (free tier, 500 requests/month). Sports are
-limited to what the API actually covers with real multi-bookmaker odds:
+Odds come from **The Odds API**. The pipeline tracks the markets the API
+actually exposes with real multi-bookmaker prices: **NRL**, **NRL State of
+Origin**, **Six Nations**, **EPL**, and **Champions League** (head-to-head).
 
-| Group  | League              | Sport key                         |
-| ------ | ------------------- | --------------------------------- |
-| Rugby  | NRL                 | `rugbyleague_nrl`                 |
-| Rugby  | NRL State of Origin | `rugbyleague_nrl_state_of_origin` |
-| Rugby  | Six Nations         | `rugbyunion_six_nations`          |
-| Soccer | EPL                 | `soccer_epl`                      |
-| Soccer | Champions League    | `soccer_uefa_champs_league`       |
+> Club logos are trademarked, so the UI generates **team crests** from real club
+> colours + monograms instead — deterministic, no copyright risk. Additional
+> markets (totals, handicap, player props) require a paid API tier and are out
+> of scope for the free build.
 
-> Super Rugby Pacific is **not** offered by The Odds API and the free
-> rugby-specific providers don't expose multi-book odds, so it's out of scope
-> for the odds-diff pipeline.
-
-## Quota strategy
-
-The free tier is 500 requests/month, so the poller polls at a cadence that
-adapts to each sport's match windows (learned from event kickoff times, not a
-hardcoded calendar):
-
-| State       | Cadence | When                              |
-| ----------- | ------- | --------------------------------- |
-| `idle`      | 10 min  | no matches near                   |
-| `pre_match` | 1 min   | kickoff within 2 hours            |
-| `in_play`   | 30 sec  | match in progress                 |
-
-When the API reports zero remaining requests, the poller backs every sport off
-to hourly so a runaway loop can't blow a paid plan.
-
-## Run it (Step 1)
+## Run it locally
 
 ```bash
-cp .env.example .env       # add your ODDS_API_KEY
+git clone https://github.com/coryypeters/nrl-odds-intelligence-pipeline.git
+cd nrl-odds-intelligence-pipeline
+cp .env.example .env          # add your free Odds API key
 docker compose up --build
 ```
 
-Watch snapshots land in the stream:
+| Surface        | URL |
+| -------------- | --- |
+| Dashboard      | http://localhost:5173 |
+| API — events   | http://localhost:8000/api/events |
+| API — odds     | http://localhost:8000/api/odds |
+| API — match    | http://localhost:8000/api/match/{event_id} |
+| API — health   | http://localhost:8000/api/health |
+
+Verify snapshots are flowing:
 
 ```bash
 docker compose exec redis redis-cli XRANGE raw_odds - + COUNT 5
 ```
 
+## Deployment
 
-## Access (full stack)
+See [DEPLOY.md](DEPLOY.md) for deploying the five services to Railway with a
+managed Redis.
 
-After `docker compose up --build`, five services run: redis, poller, processor,
-api, frontend.
+## Design notes
 
-| Surface            | URL                              |
-| ------------------ | -------------------------------- |
-| Dashboard          | http://localhost:5173            |
-| API — events       | http://localhost:8000/api/events |
-| API — odds         | http://localhost:8000/api/odds   |
-| API — health       | http://localhost:8000/api/health |
-| API — match detail | http://localhost:8000/api/match/{event_id} |
+- **Quota-aware polling.** The poller learns each sport's match windows from
+  event kickoff times and adapts cadence (10 min idle -> 1 min pre-match ->
+  30 s in-play), with a hard backoff if the API quota is exhausted.
+- **Exchange prices handled correctly.** Betfair lay markets are kept distinct
+  from back markets so they can't fake an arbitrage.
+- **Honest analytics.** The "expected margin" and recommendations are derived
+  from market probabilities and labelled as such — never presented as form
+  predictions the data can't support.
 
-The match detail page adds a derived expected-margin model (computed from market
-win probability — labelled as a model, not a bookmaker line) and live/recent
-scores from The Odds API's free scores endpoint.
+## Responsible gambling
 
-The dashboard loads event history on open, then streams new signals live over
-WebSocket. Pick a match in the odds panel to chart its line movement.
-
-
-## Team imagery
-
-Club logos are trademarked, so this project does not bundle or hotlink them.
-Each team instead gets a **generated crest** — its real club colours plus a
-monogram — produced deterministically in `frontend/src/teams.js`. This needs no
-network, carries no copyright risk, and updates automatically for any team in
-the feed. The hero uses an Unsplash-licensed stadium photo (free for commercial
-use, no attribution required) with a CSS gradient fallback.
-
-## Project layout
-
-```
-odds-intelligence-pipeline/
-├── poller/                    # Step 1 — ingestion (done)
-│   ├── sports_config.py       # verified sport keys + poll cadences
-│   ├── odds_client.py         # The Odds API wrapper + quota tracking
-│   ├── stream_writer.py       # Redis Streams producer
-│   ├── scheduler.py           # cadence loop, the poller entrypoint
-│   ├── requirements.txt
-│   └── Dockerfile
-├── processor/                 # Step 2/3 — diff + detection (next)
-├── api/                       # Step 4 — FastAPI + WebSocket
-├── frontend/                  # Step 5 — React dashboard
-├── docker-compose.yml
-└── .env.example
-```
-
-## Roadmap
-
-- [x] **Step 1** — poller + Redis Streams ingestion
-- [x] **Step 2** — diff engine (snapshot deltas per outcome per book)
-- [x] **Step 3** — movement/steam detector + arbitrage scanner
-- [x] **Step 4** — FastAPI WebSocket push + event history endpoints
-- [x] **Step 5** — React dashboard (event feed, odds table, movement chart)
-- [ ] **Step 6** — Railway deploy
+This project is for analysis and demonstration only. It surfaces market
+information; it does not encourage betting. The UI links to NZ support services
+and includes limit-setting prompts. 18+.
